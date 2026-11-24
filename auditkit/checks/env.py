@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 import ast
-import glob
 import json
 import re
 from pathlib import Path
 
 from ..model import Context, Finding
-from ..util import match_any, read_text, run, which
+from ..util import match_any, read_text, redact_json_file, run, safe_glob, which
+from . import htmlcheck
 
 FRONTEND_EXT = (".html", ".htm", ".jsx", ".tsx", ".vue", ".svelte", ".css", ".scss")
 POSIX_ONLY = {"fcntl", "pwd", "grp", "resource", "termios", "pty", "tty", "syslog", "crypt"}
@@ -135,42 +135,38 @@ def run_uiux(ctx: Context) -> None:
         res.notes.append("项目里没有前端页面（html / jsx / tsx / vue / css），也没有配置 ui.urls，本类不适用、不计入总分。")
         return
     for f in pages:
-        text = read_text(ctx.base / f)
-
-        def add(rule, sev, pat_line, msg, cause, fix, code=""):
-            res.findings.append(Finding(category="11", tool="HTML 静态检查", rule=rule, severity=sev, file=f, line=pat_line,
-                                        message=msg, cause=cause, fix=fix, fix_code=code))
-        if "<html" in text and not re.search(r"<html[^>]*\blang=", text):
-            add("html-lang", "low", 1, "<html> 没有 lang 属性", "读屏软件无法判断朗读语言，翻译工具也会误判。", "加上页面语言。", '<html lang="zh-CN">')
-        if "<head" in text and "viewport" not in text:
-            add("viewport", "medium", 1, "没有 viewport meta", "手机上按桌面宽度渲染，文字极小。", "加 viewport 声明。",
-                '<meta name="viewport" content="width=device-width, initial-scale=1">')
-        for m in re.finditer(r"<img\b(?![^>]*\balt=)[^>]*>", text):
-            add("img-alt", "medium", text.count("\n", 0, m.start()) + 1, "图片没有 alt", "读屏用户不知道图片内容，图片加载失败时也没有替代文字。",
-                "有意义的图片写描述，装饰图写 alt=\"\"。")
-        for m in re.finditer(r"<input\b(?![^>]*\b(aria-label|aria-labelledby|id|type=\"(hidden|submit|button)\")=?)[^>]*>", text):
-            add("input-label", "medium", text.count("\n", 0, m.start()) + 1, "输入框没有关联的 label", "读屏用户不知道该填什么，点击文字也无法聚焦输入框。",
-                "用 <label for> 关联，或加 aria-label。")
+        for hit in htmlcheck.check_html(read_text(ctx.base / f)):
+            res.findings.append(Finding(category="11", tool="HTML 静态检查", file=f, **hit))
     if pages:
-        res.use("HTML 静态检查（lang / viewport / alt / label）")
+        res.use("HTML 静态检查（解析器：表单标签、按钮 / 链接名称、ARIA 引用、重复 id、lang / viewport / title / alt）")
+        res.notes.append("本地 HTML 是结构检查：只看写在文件里的标签和属性，不执行脚本、不算样式。"
+                         "对比度、焦点顺序、脚本生成的节点等完整的 axe-core 规则，需要在 profile 的 ui.urls 里配置页面地址，由 Lighthouse 在真实页面上跑。")
+    other = ctx.by_ext(".jsx", ".tsx", ".vue", ".svelte")
+    if other:
+        res.notes.append(f"{len(other)} 个 JSX / TSX / Vue / Svelte 组件文件没有做无障碍检查（不是 HTML，本系统不解析）；"
+                         "这部分同样靠 ui.urls + Lighthouse 覆盖。")
     npx = which("npx")
     if urls and npx:
         for i, u in enumerate(urls[:5]):
             out_json = ctx.raw / f"lighthouse_{i}.json"
+            # 在审查系统自己的目录里启动；不加 --no-sandbox，保留 Chrome 自身的沙箱
             run([npx, "--yes", "lighthouse", u, "--quiet", "--output=json", f"--output-path={out_json}",
-                 "--chrome-flags=--headless=new --no-sandbox"], timeout=300)
+                 "--chrome-flags=--headless=new"], cwd=ctx.raw, timeout=300, network=True)
             if not out_json.exists():
                 res.skip("Lighthouse", f"{u} 运行失败（需要本机有 Chrome）")
                 continue
+            redact_json_file(out_json)  # 报告里带页面内容
             lh = json.loads(read_text(out_json))
             res.metrics.setdefault("lighthouse", []).append(
                 (u, {k: round((v.get("score") or 0) * 100) for k, v in lh.get("categories", {}).items()}))
+            # Lighthouse 的 accessibility 类别就是 axe-core 的规则
+            axe = {r.get("id") for r in (lh.get("categories", {}).get("accessibility") or {}).get("auditRefs", [])}
             for a in lh.get("audits", {}).values():
                 if a.get("score") is not None and a["score"] < 0.5 and a.get("scoreDisplayMode") in ("binary", "numeric", "metricSavings"):
                     res.findings.append(Finding(
-                        category="11", tool="Lighthouse", rule=a["id"], severity="medium", file=u, line=0, message=a.get("title", a["id"]),
+                        category="11", tool="Lighthouse（axe-core）" if a["id"] in axe else "Lighthouse", rule=a["id"], severity="medium", file=u, line=0, message=a.get("title", a["id"]),
                         cause=re.sub(r"\[(.*?)\]\(.*?\)", r"\1", a.get("description", ""))[:260], fix=a.get("displayValue") or "按 Lighthouse 报告里的条目处理。"))
-            res.use("Lighthouse")
+            res.use("Lighthouse（无障碍部分为 axe-core）")
     elif urls:
         res.skip("Lighthouse / axe / Pa11y", "未安装 Node.js")
     else:
@@ -300,11 +296,8 @@ def _logs(ctx: Context, globs: list[str]) -> None:
     if not globs:
         res.skip("日志统计", "profile 里 runtime.log_globs 未配置")
         return
-    paths: list[str] = []
-    for g in globs:
-        paths += glob.glob(str(ctx.target / g), recursive=True)
     rows = []
-    for p in sorted(set(paths))[:60]:
+    for p in safe_glob(ctx.target, globs)[:60]:  # 不跟随链接，不碰敏感文件名
         if Path(p).stat().st_size > 200 * 1024 * 1024:
             continue
         c = dict.fromkeys((k for k, _ in LOG_PAT), 0)

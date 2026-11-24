@@ -8,6 +8,9 @@ SEVERITIES = ("critical", "high", "medium", "low")
 SEV_CN = {"critical": "严重", "high": "高", "medium": "中", "low": "低"}
 SEV_RANK = {s: i for i, s in enumerate(SEVERITIES)}
 
+MODES = ("static", "local")
+STATIC_SKIP = "静态模式不执行项目代码；--mode local 启用"
+
 CATEGORIES = {
     "01": "Bug 审查",
     "02": "安全漏洞审查",
@@ -79,6 +82,11 @@ class Context:
     results: dict[str, CategoryResult] = field(default_factory=dict)
     shared: dict = field(default_factory=dict)  # 跨检查项共享的工具输出
     log: list[str] = field(default_factory=list)
+
+    @property
+    def local(self) -> bool:
+        """只有 local 模式才允许执行被审查项目的代码（测试、cargo、基准）；默认 static。"""
+        return self.shared.get("mode") == "local"
 
     def cat(self, cid: str) -> CategoryResult:
         if cid not in self.results:

@@ -2,16 +2,16 @@
 from __future__ import annotations
 
 import ast
-import glob
 import json
 import os
 import re
 import sqlite3
 from pathlib import Path
 
-from ..model import Context, Finding
-from ..util import match_any, read_text, run, timed, which
-from ..linters import cargo_roots, cargo_env
+from ..model import STATIC_SKIP, Context, Finding
+from ..util import match_any, read_text, run, safe_glob, timed, which, write_raw
+from ..linters import cargo_fetch, cargo_roots, cargo_env
+from . import sqlfile
 
 
 # ====================================================================== 07 测试
@@ -54,11 +54,11 @@ def parse_test_output(text: str) -> dict:
 
 def run_tests_in(ctx: Context, root: Path, label: str) -> dict | None:
     cmd = test_cmd(ctx)
-    if not cmd:
+    if not cmd or not ctx.local:
         return None
     rc, out, err, secs = timed(cmd, cwd=root, timeout=int(ctx.cfg.get("python", {}).get("test_timeout", 1800)))
     text = out + "\n" + err
-    (ctx.raw / f"tests_{label}.txt").write_text(text, encoding="utf-8")
+    write_raw(ctx, f"tests_{label}.txt", text)
     r = parse_test_output(text)
     r.update(rc=rc, seconds=round(secs, 2), ok=(rc == 0))
     return r
@@ -74,7 +74,10 @@ def run_coverage(ctx: Context) -> None:
         _py_coverage(ctx)
     if ctx.by_ext(".rs"):
         _rust_tests(ctx)
-    if not res.tools_used and n_test_files == 0:
+    if not ctx.local:
+        res.notes.append("静态模式没有运行测试：本类只清点了测试文件 / 测试函数，没有通过率和覆盖率，因此不评分。")
+    if n_test_files == 0 and not res.metrics.get("rust_test_functions") and \
+            not any(t.startswith(("Coverage", "cargo")) for t in res.tools_used):
         res.findings.append(Finding(
             category="07", tool="测试清点", rule="no-tests", severity="high", file="", line=0,
             message="项目里没有找到测试文件", cause="没有自动化测试，任何改动都只能靠人工验证，回归无法发现。",
@@ -83,6 +86,9 @@ def run_coverage(ctx: Context) -> None:
 
 def _py_coverage(ctx: Context) -> None:
     res = ctx.cat("07")
+    if not ctx.local:
+        res.skip("Coverage.py / 测试运行", STATIC_SKIP)
+        return
     cmd = test_cmd(ctx)
     if not cmd:
         res.skip("Coverage.py", "profile 里没有配置 python.interpreter / python.test_cmd")
@@ -92,7 +98,8 @@ def _py_coverage(ctx: Context) -> None:
     rc, _, _ = run([py, "-c", "import coverage"], env={"PYTHONPATH": str(pylib)}, timeout=60)
     if rc != 0:
         pylib.mkdir(parents=True, exist_ok=True)
-        run([py, "-m", "pip", "install", "-q", "--disable-pip-version-check", "--target", str(pylib), "coverage"], timeout=600)
+        run([py, "-m", "pip", "install", "-q", "--disable-pip-version-check", "--target", str(pylib), "coverage"],
+            timeout=600, network=True)
         rc, _, _ = run([py, "-c", "import coverage"], env={"PYTHONPATH": str(pylib)}, timeout=60)
         if rc != 0:
             res.skip("Coverage.py", "无法为项目解释器安装 coverage（装在审查系统目录内，不动项目环境）")
@@ -103,7 +110,7 @@ def _py_coverage(ctx: Context) -> None:
     rc, out, err, secs = timed([py, "-m", "coverage", "run", "--branch", "--source=.", f"--omit={omit}", *cmd[1:]],
                                cwd=ctx.base, env=env, timeout=int(ctx.cfg.get("python", {}).get("test_timeout", 1800)))
     text = out + "\n" + err
-    (ctx.raw / "tests_baseline_coverage.txt").write_text(text, encoding="utf-8")
+    write_raw(ctx, "tests_baseline_coverage.txt", text)
     t = parse_test_output(text)
     t.update(rc=rc, seconds=round(secs, 2), ok=(rc == 0))
     res.metrics["python_tests"] = t
@@ -158,6 +165,9 @@ def _rust_tests(ctx: Context) -> None:
         n_tests += len(re.findall(r"#\[(?:tokio::)?test(?:\(.*?\))?\]", read_text(ctx.base / f)))
     res.metrics["rust_test_functions"] = n_tests
     rust = ctx.cfg.get("rust", {})
+    if not ctx.local:
+        res.skip("cargo test", STATIC_SKIP + f"（静态清点到 {n_tests} 个测试函数）")
+        return
     if not which("cargo"):
         res.skip("cargo test", "未安装 Rust 工具链")
         return
@@ -167,6 +177,7 @@ def _rust_tests(ctx: Context) -> None:
     has_llvm_cov = run(["cargo", "llvm-cov", "--version"], timeout=30)[0] == 0
     agg = {"ran": 0, "failed": 0, "skipped": 0, "seconds": 0.0, "ok": True}
     for root in cargo_roots(ctx):
+        cargo_fetch(ctx, root)
         if has_llvm_cov:
             cj = ctx.raw / "rust_coverage.json"
             rc, out, err, secs = timed(["cargo", "llvm-cov", "--workspace", "--json", "--output-path", str(cj)],
@@ -180,7 +191,7 @@ def _rust_tests(ctx: Context) -> None:
             rc, out, err, secs = timed(["cargo", "test", "--workspace", "--locked"], cwd=ctx.base / root,
                                        env=cargo_env(ctx), timeout=int(rust.get("test_timeout", 3600)))
         text = out + "\n" + err
-        (ctx.raw / "tests_rust_baseline.txt").write_text(text, encoding="utf-8")
+        write_raw(ctx, "tests_rust_baseline.txt", text)
         t = parse_test_output(text)
         agg["ran"] += t["ran"] or 0
         agg["failed"] += t["failed"]
@@ -211,55 +222,107 @@ def _unescape_rust(s: str) -> str:
 
 
 def extract_sql(ctx: Context) -> list[dict]:
+    """代码里的 SQL 字符串（Python / Rust）和独立 .sql 文件里的语句。
+
+    每项：file、line、sql、dynamic、dialect；来自 .sql 文件的另有 source="file"（已经是单条语句）。
+    """
     found: list[dict] = []
+    forced = ctx.cfg.get("database", {}).get("dialect", "auto")
+    forced = None if forced in ("auto", "", None) else forced
     for f in ctx.by_ext(".py"):
+        text = read_text(ctx.base / f)
         try:
-            tree = ast.parse(read_text(ctx.base / f))
+            tree = ast.parse(text)
         except SyntaxError:
             continue
+        dialect = forced or sqlfile.detect_code(text)
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and isinstance(node.value, str) and SQL_HEAD.match(node.value):
-                found.append({"file": f, "line": node.lineno, "sql": node.value, "dynamic": False})
+                found.append({"file": f, "line": node.lineno, "sql": node.value, "dynamic": False, "dialect": dialect})
             elif isinstance(node, ast.JoinedStr):
                 parts = [v.value if isinstance(v, ast.Constant) and isinstance(v.value, str) else "{}" for v in node.values]
                 s = "".join(parts)
                 if SQL_HEAD.match(s):
-                    found.append({"file": f, "line": node.lineno, "sql": s, "dynamic": True})
+                    found.append({"file": f, "line": node.lineno, "sql": s, "dynamic": True, "dialect": dialect})
+    sql_texts = {f: read_text(ctx.base / f) for f in ctx.by_ext(".sql")}
+    sql_dialects = {f: forced or sqlfile.detect(t) for f, t in sql_texts.items()}
+    # 只有查询的文件往往看不出方言：同一个项目里其他 .sql 文件都指向同一种方言时，跟着它走
+    known = sorted({d for d in sql_dialects.values() if d != "unknown"})
+    for f, text in sql_texts.items():
+        dialect = known[0] if sql_dialects[f] == "unknown" and len(known) == 1 else sql_dialects[f]
+        for line, sql in sqlfile.split_statements(text):
+            found.append({"file": f, "line": line, "sql": sql, "dynamic": False, "dialect": dialect, "source": "file"})
     for f in ctx.by_ext(".rs"):
         text = read_text(ctx.base / f)
+        dialect = forced or sqlfile.detect_code(text)
         for m in RUST_STR.finditer(text):
             raw = m.group(2) if m.group(2) is not None else _unescape_rust(m.group(3) or "")
             if SQL_HEAD.match(raw):
                 pre = text[max(0, m.start() - 12):m.start()]
                 dyn = bool(re.search(r"\{[^}]*\}", raw)) and "format!" in pre.replace(" ", "").replace("\n", "")[-9:] + "format!" * 0 \
                     or bool(re.search(r"format!\(\s*$", text[max(0, m.start() - 20):m.start()])) and "{" in raw
-                found.append({"file": f, "line": text.count("\n", 0, m.start()) + 1, "sql": raw, "dynamic": dyn})
+                found.append({"file": f, "line": text.count("\n", 0, m.start()) + 1, "sql": raw, "dynamic": dyn,
+                              "dialect": dialect})
     return found
+
+
+def _parts(s: dict) -> list[str]:
+    """.sql 文件里的条目已经是单条语句；代码里的字符串可能一次写了几条。"""
+    return [s["sql"]] if s.get("source") == "file" else [p for _, p in sqlfile.split_statements(s["sql"])]
+
+
+def _explain(mem: sqlite3.Connection, part: str) -> list | None:
+    n = len(re.findall(r"\?(?!\d)", part))
+    numbered = [int(x) for x in re.findall(r"\?(\d+)", part)]
+    named = sorted(set(re.findall(r"(?<![:\w])[:@$]([A-Za-z_]\w*)", part)))
+    try:
+        params = {k: None for k in named} if named and not n else [None] * max(n, max(numbered, default=0))
+        return mem.execute("EXPLAIN QUERY PLAN " + part, params).fetchall()
+    except (sqlite3.Error, sqlite3.Warning):
+        return None
+
+
+DIALECT_CN = {"sqlite": "SQLite", "mysql": "MySQL", "postgresql": "PostgreSQL", "unknown": "未识别"}
 
 
 def run_database(ctx: Context) -> None:
     res = ctx.cat("08")
+    dbcfg = ctx.cfg.get("database", {})
     stmts = extract_sql(ctx)
-    db_globs = ctx.cfg.get("database", {}).get("sqlite_globs", [])
-    if not stmts and not db_globs and not ctx.by_ext(".sql"):
+    db_globs = dbcfg.get("sqlite_globs", [])
+    sql_files = ctx.by_ext(".sql")
+    if not stmts and not db_globs and not sql_files:
         res.applicable = False
         res.notes.append("没有发现 SQL 语句或数据库文件。")
         return
     tests = ctx.cfg.get("test_globs", [])
     is_test = lambda f: match_any(f, tests) or "/tests/" in f or "/examples/" in f  # noqa: E731
+    parsed = {s["file"] for s in stmts if s.get("source") == "file"}
+    empty = [f for f in sql_files if f not in parsed]
+    if empty:
+        res.notes.append(f"{len(empty)} 个 .sql 文件没有解析出任何语句（空文件或只有注释），未检查："
+                         + "、".join(empty[:5]) + (" 等" if len(empty) > 5 else ""))
     mem = sqlite3.connect(":memory:")
+    schema = sqlfile.Schema()
     ddl = 0
     for s in sorted(stmts, key=lambda s: is_test(s["file"])):
-        for part in s["sql"].split(";"):
-            if re.match(r"\s*CREATE\s", part) and not (is_test(s["file"]) and ddl):
+        if s["dynamic"]:
+            continue
+        for part in _parts(s):
+            if not re.match(r"\s*(CREATE|ALTER)\s", part, re.I):
+                continue
+            schema.feed(part, s["file"], s["line"], s["dialect"], is_test(s["file"]))
+            if s["dialect"] in ("sqlite", "unknown") and re.match(r"\s*CREATE\s", part, re.I) and not (is_test(s["file"]) and ddl):
                 try:
                     mem.execute(part)
                     ddl += 1
-                except sqlite3.Error:
+                except (sqlite3.Error, sqlite3.Warning):
                     pass
     tables = [r[0] for r in mem.execute("SELECT name FROM sqlite_master WHERE type='table'")]
     indexes = [r[0] for r in mem.execute("SELECT name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL")]
-    checked = unverified = dynamic = 0
+    checked = unverified = dynamic = static_only = 0
+    dialects: dict[str, int] = {}
+    max_joins = int(dbcfg.get("max_joins", 6))
     for s in stmts:
         if is_test(s["file"]):
             continue
@@ -272,27 +335,23 @@ def run_database(ctx: Context) -> None:
                     cause="拼接进 SQL 的片段不经过参数绑定；片段来自外部输入时是注入点，另外每次文本不同也用不上预编译缓存。",
                     fix="值一律用 `?` 绑定；只有占位符个数、表名这类结构性片段才拼接，并确认来源是代码内常量。"))
             continue
-        for part in s["sql"].split(";"):
-            part = part.strip()
-            if not part or re.match(r"(CREATE|ALTER|DROP|PRAGMA)\b", part):
+        d = s["dialect"]
+        for part in _parts(s):
+            if not sqlfile.DML_HEAD.match(part):
                 continue
-            if re.search(r"SELECT\s+\*", part):
-                res.findings.append(Finding(
-                    category="08", tool="SQL 提取", rule="select-star", severity="low", file=s["file"], line=s["line"],
-                    message="SELECT *：" + " ".join(part.split())[:120],
-                    cause="取回所有列：表结构一加列，读取量和按位置取值的代码都会受影响。", fix="列出实际用到的列。"))
-            n = len(re.findall(r"\?(?!\d)", part))
-            numbered = [int(x) for x in re.findall(r"\?(\d+)", part)]
-            named = sorted(set(re.findall(r"(?<![:\w])[:@$]([A-Za-z_]\w*)", part)))
-            try:
-                params = {k: None for k in named} if named and not n else [None] * max(n, max(numbered, default=0))
-                plan = mem.execute("EXPLAIN QUERY PLAN " + part, params).fetchall()
-            except sqlite3.Error:
+            dialects[d] = dialects.get(d, 0) + 1
+            # SQLite（和认不出方言的）用内存库拿真实执行计划；MySQL / PostgreSQL 只做静态规则
+            plan = _explain(mem, part) if d in ("sqlite", "unknown") else None
+            if d not in ("sqlite", "unknown"):
+                static_only += 1
+            elif plan is None:
                 unverified += 1
-                continue
-            checked += 1
+            else:
+                checked += 1
+            for hit in sqlfile.check_statement(part, schema, d, verified=plan is not None, max_joins=max_joins):
+                res.findings.append(Finding(category="08", tool="SQL 静态检查", file=s["file"], line=s["line"], **hit))
             has_filter = bool(re.search(r"\b(WHERE|JOIN)\b", part, re.I))
-            for row in plan:
+            for row in plan or []:
                 detail = row[-1]
                 m = re.match(r"SCAN (\w+)", detail)
                 if m and has_filter and "USING" not in detail and m.group(1) in tables:
@@ -307,12 +366,27 @@ def run_database(ctx: Context) -> None:
                         category="08", tool="EXPLAIN QUERY PLAN", rule="sort-without-index", severity="low", file=s["file"], line=s["line"],
                         message="ORDER BY 需要临时排序：" + " ".join(part.split())[:110],
                         cause="排序列没有索引，每次查询都要把结果集整体排序。", fix="结果集大时给排序列建索引；小表可以忽略。"))
-    res.metrics.update(sql_statements=len([s for s in stmts if not is_test(s["file"])]), sql_checked=checked,
-                       sql_unverified=unverified, sql_dynamic=dynamic, schema_tables=tables, schema_indexes=indexes)
-    res.use("SQL 提取 + EXPLAIN QUERY PLAN（SQLite 内存库，按代码里的建表语句建库）")
+    for hit in sqlfile.check_schema(schema, int(dbcfg.get("max_indexes", 6))):
+        res.findings.append(Finding(category="08", tool="SQL 静态检查", **hit))
     mem.close()
+    live = [s for s in stmts if not is_test(s["file"])]
+    known = {t.lower() for t in tables}
+    res.metrics.update(
+        sql_statements=len(live), sql_from_files=sum(1 for s in live if s.get("source") == "file"),
+        sql_checked=checked, sql_unverified=unverified, sql_static_only=static_only, sql_dynamic=dynamic,
+        sql_dialects={DIALECT_CN.get(k, k): v for k, v in sorted(dialects.items())},
+        schema_tables=tables + sorted(t for t in schema.tables if t not in known),
+        schema_indexes=indexes + sorted({i.name for i in schema.indexes if i.name and i.dialect not in ("sqlite", "unknown")}))
+    if live:
+        res.use("SQL 静态检查（代码内 SQL + 独立 .sql 文件：索引、JOIN、方言规则）")
+    if checked or unverified:
+        res.use("EXPLAIN QUERY PLAN（SQLite 内存库，按建表语句建库）")
+    if static_only:
+        res.skip("EXPLAIN（MySQL / PostgreSQL）", f"需要连接数据库服务器，本系统不做；{static_only} 条语句只做了静态规则检查")
     _sample_dbs(ctx, db_globs)
-    res.skip("pt-query-digest / pgBadger / MySQL Workbench", "面向 MySQL / PostgreSQL 的慢日志工具，本项目只有 SQLite")
+    seen = "、".join(DIALECT_CN.get(k, k) for k in sorted(dialects)) or "无"
+    res.skip("pt-query-digest / pgBadger / MySQL Workbench",
+             f"分析的是数据库服务器的慢查询日志，静态审查拿不到（本次识别到的方言：{seen}）")
 
 
 def _index_hint(sql: str, table: str) -> str:
@@ -323,9 +397,7 @@ def _index_hint(sql: str, table: str) -> str:
 def _sample_dbs(ctx: Context, globs: list[str]) -> None:
     """对项目里已有的 SQLite 文件做只读体检（immutable 打开，不产生 -wal / -shm 文件）。"""
     res = ctx.cat("08")
-    paths: list[str] = []
-    for g in globs:
-        paths += glob.glob(str(ctx.target / g), recursive=True)
+    paths = safe_glob(ctx.target, globs)  # 不跟随链接，不碰敏感文件名
     limit = int(ctx.cfg.get("database", {}).get("max_db_mb", 300)) * 1024 * 1024
     rows = []
     for p in sorted(set(paths))[:40]:

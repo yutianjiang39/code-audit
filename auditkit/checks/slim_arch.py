@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
 from collections import defaultdict
 from pathlib import Path
 
-from ..model import Context, Finding
-from ..util import kit_python, match_any, read_text, run, size_stats, which
+from ..model import STATIC_SKIP, Context, Finding
+from ..util import kit_python, match_any, norm_rel, read_text, redact_json_file, run, size_stats, which, write_raw
 from ..linters import cargo_roots, cargo_env
 
 
@@ -28,12 +29,12 @@ def _vulture(ctx: Context) -> None:
         return
     py = kit_python(ctx.kit_root)
     conf = int(ctx.cfg.get("slim", {}).get("vulture_min_confidence", 60))
-    rc, out, err = run([py, "-m", "vulture", *files, "--min-confidence", str(conf), "--sort-by-size"],
+    rc, out, err = run([py, "-I", "-m", "vulture", *files, "--min-confidence", str(conf), "--sort-by-size"],
                        cwd=ctx.base, timeout=600)
     if rc not in (0, 3):
         res.skip("Vulture", (err.strip().splitlines() or ["运行失败"])[-1][:160])
         return
-    (ctx.raw / "vulture.txt").write_text(out, encoding="utf-8")
+    write_raw(ctx, "vulture.txt", out)
     tests = ctx.cfg.get("test_globs", [])
     dead_lines = 0
     for line in out.splitlines():
@@ -73,21 +74,29 @@ def _jscpd(ctx: Context) -> None:
     slim = ctx.cfg.get("slim", {})
     ignore = ["**/.venv/**", "**/target/**", "**/node_modules/**"] + \
              [f"**/{g}" if not g.startswith("**") else g for g in ctx.cfg.get("exclude", []) + ctx.cfg.get("test_globs", [])]
-    rc, out, err = run([npx, "--yes", "jscpd@4", ".", "--reporters", "json", "--output", str(out_dir), "--silent",
+    # 不在项目副本里启动 npx：npm 会读取当前目录的 .npmrc / package.json。副本路径作为参数传入。
+    # jscpd 在 Windows 上只认相对的正斜杠路径（绝对路径、反斜杠路径都会一个文件也扫不到，且退出码仍是 0）
+    try:
+        scan = Path(os.path.relpath(ctx.base, ctx.raw)).as_posix()
+    except ValueError:  # 不同盘符
+        scan = ctx.base.as_posix()
+    rc, out, err = run([npx, "--yes", "jscpd@4", scan, "--reporters", "json", "--output", str(out_dir), "--silent",
                         "--min-lines", str(slim.get("dup_min_lines", 10)), "--min-tokens", str(slim.get("dup_min_tokens", 100)),
-                        "--format", ",".join(fmts), "--ignore", ",".join(ignore), "--gitignore"],
-                       cwd=ctx.base, timeout=900)
+                        "--format", ",".join(fmts), "--ignore", ",".join(ignore)],
+                       cwd=ctx.raw, timeout=900, network=True)
     report = out_dir / "jscpd-report.json"
     if not report.exists():
-        res.skip("jscpd", f"运行失败：{(err or out).strip()[-160:]}")
+        res.skip("jscpd", f"运行失败：{(err or out).strip()[-160:] or '没有生成报告'}")
         return
+    redact_json_file(report)  # 报告里带重复代码的原文片段
     data = json.loads(read_text(report))
+    here =lambda name: norm_rel(os.path.normpath(name if os.path.isabs(name) else ctx.raw / name), ctx.base)  # noqa: E731
     total = data.get("statistics", {}).get("total", {})
     res.metrics["duplication"] = {"percentage": total.get("percentage", 0), "lines": total.get("duplicatedLines", 0),
                                   "clones": total.get("clones", 0)}
     for d in data.get("duplicates", []):
         a, b = d.get("firstFile", {}), d.get("secondFile", {})
-        fa, fb = a.get("name", "").replace("\\", "/"), b.get("name", "").replace("\\", "/")
+        fa, fb = here(a.get("name", "")), here(b.get("name", ""))
         if fa not in ctx.files or fb not in ctx.files:
             continue
         n = d.get("lines", 0)
@@ -334,6 +343,9 @@ def _scc(nodes: set[str], edges: dict[str, set[str]]) -> list[list[str]]:
 def _crate_graph(ctx: Context) -> None:
     res = ctx.cat("05")
     if not ctx.by_ext(".rs") or not which("cargo"):
+        return
+    if not ctx.local:
+        res.skip("cargo metadata（crate 依赖图）", STATIC_SKIP)
         return
     rank = ctx.cfg.get("architecture", {}).get("crate_rank", {})
     for root in cargo_roots(ctx):

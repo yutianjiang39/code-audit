@@ -47,7 +47,8 @@ def score_all(ctx: Context) -> dict:
         if not res.applicable or not res.tools_used:
             res.score = None
             rows.append({"id": cid, "name": res.name, "score": None, "counts": counts, "weight": 0,
-                         "reason": "不适用" if not res.applicable else "没有可用的工具，未评分"})
+                         "reason": "不适用" if not res.applicable else
+                         "静态模式未运行测试，未评分" if cid == "07" and not ctx.local else "没有可用的工具，未评分"})
             continue
         penalty = sum(SEV_WEIGHT[s] * n for s, n in counts.items())
         score = 100 * math.exp(-(penalty / _basis(ctx, cid, kloc)) / DENSITY_SCALE)

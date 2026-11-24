@@ -9,8 +9,8 @@ import re
 from pathlib import Path
 
 from . import knowledge as K
-from .model import Context, Finding
-from .util import chunks, kit_python, kit_tool, norm_rel, read_text, run, which, match_any
+from .model import STATIC_SKIP, Context, Finding
+from .util import chunks, kit_python, kit_tool, norm_rel, read_text, run, which, match_any, write_raw
 
 
 def _sev(ctx: Context, rule: str, default: str) -> str:
@@ -86,7 +86,7 @@ def run_ruff(ctx: Context) -> None:
             for c in cats:
                 ctx.cat(c).skip("Ruff", f"运行失败：{err.strip()[:200]}")
             return
-    (ctx.raw / "ruff.json").write_text(json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8")
+    write_raw(ctx, "ruff.json", json.dumps(items, ensure_ascii=False, indent=1))
     cache: dict[str, list[str]] = {}
     for it in items:
         rule = it.get("code") or "invalid-syntax"
@@ -132,14 +132,15 @@ def run_pylint(ctx: Context) -> None:
     if not files or not ctx.cfg.get("python", {}).get("pylint", True):
         return
     py = kit_python(ctx.kit_root)
-    rc, out, _ = run([py, "-c", "import pylint"], timeout=60)
+    rc, out, _ = run([py, "-I", "-c", "import pylint"], timeout=60)
     if rc != 0:
         for c in ("01", "05", "06"):
             ctx.cat(c).skip("Pylint", "未安装")
         return
     items: list[dict] = []
     for part in chunks(files, 300):
-        rc, out, err = run([py, "-m", "pylint", "--rcfile=", "--disable=all", "--enable=" + ",".join(K.PYLINT_ENABLE),
+        # -I：当前目录（项目副本）不进 sys.path，项目里的同名模块不会被审查系统的解释器导入
+        rc, out, err = run([py, "-I", "-m", "pylint", "--rcfile=", "--disable=all", "--enable=" + ",".join(K.PYLINT_ENABLE),
                             "--disable=" + ",".join(K.PYLINT_DISABLE), "--output-format=json", "--jobs=0",
                             "--max-module-lines=800", "--max-locals=25", "--max-attributes=15",
                             "--max-public-methods=30", "--max-nested-blocks=5", "--score=n", "--persistent=n",
@@ -148,7 +149,7 @@ def run_pylint(ctx: Context) -> None:
             items += json.loads(out or "[]")
         except json.JSONDecodeError:
             ctx.say(f"  ! Pylint 输出无法解析：{(err or out)[:200]}")
-    (ctx.raw / "pylint.json").write_text(json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8")
+    write_raw(ctx, "pylint.json", json.dumps(items, ensure_ascii=False, indent=1))
     for it in items:
         rule = it.get("message-id", "")
         info = K.lookup(K.PYLINT, rule) or ("06", "low", "", "")
@@ -188,10 +189,24 @@ def cargo_env(ctx: Context) -> dict:
             "CLIPPY_CONF_DIR": str(ctx.kit_root / "auditkit" / "conf"), "CARGO_TERM_COLOR": "never"}
 
 
+def cargo_fetch(ctx: Context, root: str) -> None:
+    """先把依赖下载好（这一步带代理设置、不编译）；之后真正执行项目代码的 cargo 调用就不带代理变量了。"""
+    done = ctx.shared.setdefault("cargo_fetched", set())
+    if root in done:
+        return
+    done.add(root)
+    cmd = ["cargo", "fetch"] + (["--locked"] if (ctx.base / root / "Cargo.lock").exists() else [])
+    run(cmd, cwd=ctx.base / root, env=cargo_env(ctx), timeout=1800, network=True)
+
+
 def run_clippy(ctx: Context) -> None:
     if not ctx.by_ext(".rs"):
         return
     cats = ("01", "03", "04", "06")
+    if not ctx.local:  # Clippy 要编译：依赖和项目自己的 build.rs、过程宏都会被执行
+        for c in cats:
+            ctx.cat(c).skip("Clippy", STATIC_SKIP)
+        return
     if not which("cargo"):
         for c in cats:
             ctx.cat(c).skip("Clippy", "未安装 Rust 工具链")
@@ -204,6 +219,7 @@ def run_clippy(ctx: Context) -> None:
         if (ctx.base / root / "Cargo.lock").exists():
             cmd.append("--locked")
         cmd += ["--"] + [x for lint in extra for x in ("-W", lint)]
+        cargo_fetch(ctx, root)
         rc, out, err = run(cmd, cwd=ctx.base / root, env=cargo_env(ctx), timeout=3600)
         if rc not in (0, 101) or (rc == 101 and '"reason"' not in out):
             for c in cats:
@@ -252,7 +268,7 @@ def run_clippy(ctx: Context) -> None:
                      if rule.startswith("clippy::") else "")))
         for c in cats:
             ctx.cat(c).use("Clippy")
-    (ctx.raw / "clippy.jsonl").write_text("\n".join(raw_lines), encoding="utf-8")
+    write_raw(ctx, "clippy.jsonl", "\n".join(raw_lines))
 
 
 # ------------------------------------------------------------------ Semgrep
@@ -270,9 +286,10 @@ def run_semgrep(ctx: Context) -> None:
     cmd = [sg, "scan", "--json", "--quiet", "--metrics", "off", "--disable-version-check", "--timeout", "30"]
     for p in packs:
         cmd += ["--config", p]
-    for g in ctx.cfg.get("exclude", []) + ctx.cfg.get("test_globs", []):
-        cmd += ["--exclude", g]
-    rc, out, err = run(cmd + ["."], cwd=ctx.base, timeout=1800)
+    # --no-git-ignore：副本在 kit 的 .work/ 下，而 kit 自己的 .gitignore 忽略 .work/，Semgrep 会顺着上层仓库把整个副本都当成被忽略。
+    # 不传 --exclude：Windows 上 semgrep.exe 会把参数里的通配符展开成文件名，结果是“排除的文件”反而成了显式扫描目标。
+    # 排除范围和测试文件改在下面按结果过滤。
+    rc, out, err = run(cmd + ["--no-git-ignore", "."], cwd=ctx.base, timeout=1800, network=True)
     try:
         data = json.loads(out)
     except json.JSONDecodeError:
@@ -286,12 +303,12 @@ def run_semgrep(ctx: Context) -> None:
     for r in data.get("results", []):
         r.get("extra", {}).pop("lines", None)
         r.get("extra", {}).pop("fingerprint", None)
-    (ctx.raw / "semgrep.json").write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    write_raw(ctx, "semgrep.json", json.dumps(data, ensure_ascii=False, indent=1))
     for r in data.get("results", []):
         ex = r.get("extra", {})
         meta = ex.get("metadata", {})
         rel = norm_rel(r.get("path", ""), ctx.base)
-        if rel not in ctx.files:
+        if rel not in ctx.files or _is_test(ctx, rel):
             continue
         rule = r.get("check_id", "").split(".")[-1]
         is_secret = "secret" in r.get("check_id", "").lower()

@@ -1,6 +1,10 @@
 {
   "name": "myproj",
   "target": "../MyProj",
+  "execution": {
+    "mode": "static",
+    "env_passthrough": []
+  },
   "exclude": ["vendor/*"],
   "test_globs": ["tests/*"],
   "python": {
@@ -17,6 +21,9 @@
       "app": ["app"],
       "ops": ["ops", "app"]
     }
+  },
+  "database": {
+    "dialect": "auto"
   },
   "accepted": [
     {

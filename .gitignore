@@ -5,3 +5,4 @@ reports/
 __pycache__/
 profiles/*.json
 !profiles/example.json
+.ruff_cache/

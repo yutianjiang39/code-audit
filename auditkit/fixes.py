@@ -9,7 +9,7 @@ import json
 import statistics
 
 from .model import Context
-from .util import kit_tool, run, size_stats, sync_copy, timed, which
+from .util import GIT_SAFE, kit_python, kit_tool, run, size_stats, sync_copy, timed, which, write_raw
 from .linters import apply_ruff_fixes, ruff_args
 from . import knowledge as K
 from .checks.tests_db import project_python, run_tests_in
@@ -27,12 +27,18 @@ def run_fix_stage(ctx: Context) -> dict:
     r["syntax_ok"] = _compile_check(ctx, changed)
     r["size"] = _size_compare(ctx)
     r["issues"] = _recount(ctx)
-    ctx.say("  · 在 fixed 副本里重跑测试")
-    r["tests_after"] = run_tests_in(ctx, ctx.fixed, "fixed")
-    r["tests_before"] = ctx.cat("07").metrics.get("python_tests")
-    ctx.say("  · 性能基准：修复前 / 修复后")
-    r["bench"] = _bench(ctx)
-    (ctx.raw / "fix_stage.json").write_text(json.dumps(r, ensure_ascii=False, indent=1), encoding="utf-8")
+    r["mode"] = ctx.shared.get("mode", "static")
+    if ctx.local:
+        ctx.say("  · 在 fixed 副本里重跑测试")
+        r["tests_after"] = run_tests_in(ctx, ctx.fixed, "fixed")
+        r["tests_before"] = ctx.cat("07").metrics.get("python_tests")
+        ctx.say("  · 性能基准：修复前 / 修复后")
+        r["bench"] = _bench(ctx)
+    else:  # 回归测试和基准都要执行项目代码
+        ctx.say("  · 静态模式：不重跑测试、不跑基准（补丁只做了语法校验）")
+        r["tests_after"] = r["tests_before"] = None
+        r["bench"] = []
+    write_raw(ctx, "fix_stage.json", json.dumps(r, ensure_ascii=False, indent=1))
     return r
 
 
@@ -59,17 +65,17 @@ def _check_patch(ctx: Context) -> str:
     """只做 `git apply --check`（只读），确认补丁能直接套到原项目上。"""
     if not which("git") or not (ctx.target / ".git").exists():
         return "原项目不是 git 仓库，未验证；可以用 `patch -p1 < fixes.patch` 应用"
-    rc, out, err = run(["git", "apply", "--check", str(ctx.out / "fixes.patch")], cwd=ctx.target, timeout=120)
+    rc, out, err = run(["git", *GIT_SAFE, "apply", "--check", str(ctx.out / "fixes.patch")], cwd=ctx.target, timeout=120)
     return "可直接应用（git apply --check 通过）" if rc == 0 else "与当前工作区有冲突：" + (err.strip().splitlines() or ["?"])[0][:160]
 
 
 def _compile_check(ctx: Context, changed: list[str]) -> bool:
-    py = project_python(ctx) or "python"
+    py = kit_python(ctx.kit_root)  # 只做 ast.parse，用审查系统自己的解释器，不启动项目的
     files = [f for f in changed if f.endswith(".py")]
     if not files:
         return True
     code = "import sys,ast\nbad=0\nfor p in sys.argv[1:]:\n    try: ast.parse(open(p,encoding='utf-8').read(),p)\n    except SyntaxError as e: print(p,e); bad=1\nsys.exit(bad)"
-    return all(run([py, "-c", code, *files[i:i + 100]], cwd=ctx.fixed, timeout=120)[0] == 0 for i in range(0, len(files), 100))
+    return all(run([py, "-I", "-c", code, *files[i:i + 100]], cwd=ctx.fixed, timeout=120)[0] == 0 for i in range(0, len(files), 100))
 
 
 def _size_compare(ctx: Context) -> dict:
@@ -105,6 +111,8 @@ def _recount(ctx: Context) -> dict | None:
 
 def _bench(ctx: Context) -> list[dict]:
     """每个基准在两个副本里交替运行 N 次，取中位数和最小值（交替是为了抵消机器负载漂移）。"""
+    if not ctx.local:
+        return []
     py = project_python(ctx) or "python"
     rows = []
     for b in ctx.cfg.get("bench", []):
@@ -112,7 +120,7 @@ def _bench(ctx: Context) -> list[dict]:
         n = int(b.get("repeat", 5))
         t: dict[str, list[float]] = {"before": [], "after": []}
         ok = True
-        for label, root in (("before", ctx.base), ("after", ctx.fixed)):  # 预热，不计时
+        for _label, root in (("before", ctx.base), ("after", ctx.fixed)):  # 预热，不计时
             ok = ok and run(cmd, cwd=root / b.get("cwd", "."), timeout=int(b.get("timeout", 600)))[0] == 0
         if not ok:
             rows.append({"name": b["name"], "error": "命令执行失败（退出码非 0）"})

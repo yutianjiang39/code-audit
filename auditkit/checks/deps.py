@@ -6,8 +6,8 @@ import re
 import urllib.error
 import urllib.request
 
-from ..model import Context, Finding
-from ..util import chunks, kit_tool, read_text, run, which
+from ..model import STATIC_SKIP, Context, Finding
+from ..util import chunks, kit_tool, read_text, run, which, write_raw
 from ..linters import cargo_roots, cargo_env
 from .tests_db import project_python
 
@@ -71,13 +71,15 @@ def run_deps(ctx: Context) -> None:
         res.notes.append("没有发现依赖清单。")
         return
     n_deps = 0
-    if reqs or project_python(ctx):
+    if reqs or (ctx.local and project_python(ctx)):
         n_deps += _python(ctx, reqs)
     for lock in locks:
         n_deps += _cargo_lock(ctx, lock)
-    if locks:
+    if locks and ctx.local:
         _cargo_outdated(ctx)
         _cargo_licenses(ctx)
+    elif locks:  # cargo 读取项目里的 .cargo/config.toml，其中可以指定任意可执行文件
+        res.skip("cargo update --dry-run / cargo metadata（过期版本、许可证）", STATIC_SKIP)
     for lock in npm:
         _npm(ctx, lock)
     res.metrics["dependency_count"] = n_deps
@@ -101,21 +103,27 @@ def _python(ctx: Context, reqs: list[str]) -> int:
                     message=f"依赖没有锁定精确版本：{s}",
                     cause="同一份清单在不同时间安装会得到不同版本，线上与本地行为可能不一致，也无法复现历史构建。",
                     fix="用 `==` 锁定版本（或用 pip-compile / uv 生成带哈希的锁文件），升级走单独的提交。"))
+    if not ctx.local:
+        # pip-audit 要么启动项目解释器，要么为了解析依赖去构建 sdist（会执行 setup.py）；静态模式两样都不做
+        _pypi_osv(ctx, reqs)
+        res.skip("pip-audit / pip list --outdated", STATIC_SKIP + "（改为对 == 锁定的条目直接查 OSV.dev）")
+        return n
     py = project_python(ctx)
     pa = kit_tool(ctx.kit_root, "pip-audit")
     if not pa:
         res.skip("pip-audit", "未安装")
     else:
         if py:
-            rc, out, err = run([pa, "--format", "json", "--progress-spinner", "off"], env={"PIPAPI_PYTHON_LOCATION": py}, timeout=600)
+            rc, out, err = run([pa, "--format", "json", "--progress-spinner", "off"], env={"PIPAPI_PYTHON_LOCATION": py},
+                               timeout=600, network=True)
             src = "项目解释器里实际安装的包"
         else:
             args = []
             for f in reqs:
                 args += ["-r", str(ctx.base / f)]
-            rc, out, err = run([pa, "--format", "json", "--progress-spinner", "off", *args], timeout=900)
+            rc, out, err = run([pa, "--format", "json", "--progress-spinner", "off", *args], timeout=900, network=True)
             src = "requirements 文件"
-        (ctx.raw / "pip_audit.json").write_text(out or err, encoding="utf-8")
+        write_raw(ctx, "pip_audit.json", out or err)
         try:
             data = json.loads(out[out.index("{"):])
         except ValueError:
@@ -141,7 +149,8 @@ def _python(ctx: Context, reqs: list[str]) -> int:
             res.metrics["python_packages_audited"] = len(deps)
             res.use(f"pip-audit（{src}）")
     if py:
-        rc, out, err = run([py, "-m", "pip", "list", "--outdated", "--format", "json", "--disable-pip-version-check"], timeout=300)
+        rc, out, err = run([py, "-m", "pip", "list", "--outdated", "--format", "json", "--disable-pip-version-check"],
+                           timeout=300, network=True)
         try:
             old = json.loads(out)
         except ValueError:
@@ -162,6 +171,55 @@ def _python(ctx: Context, reqs: list[str]) -> int:
                     fix="逐个看升级说明，在分支上升级并跑完整测试；不要一次升级多个大版本。"))
             res.use("pip list --outdated")
     return n
+
+
+PINNED = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[[^\]]*\])?\s*==\s*([A-Za-z0-9][A-Za-z0-9.!+_-]*)\s*(?:;.*)?$")
+
+
+def _pypi_osv(ctx: Context, reqs: list[str]) -> None:
+    """静态模式：只读 requirements 文件，对 `==` 锁定的条目查 OSV.dev；没锁定的版本无从判断，照实计数。"""
+    res = ctx.cat("09")
+    pins: list[tuple[str, str, str, int]] = []
+    loose = 0
+    for f in reqs:
+        for i, line in enumerate(read_text(ctx.base / f).splitlines(), 1):
+            s = line.split("#")[0].split("--hash")[0].strip().rstrip("\\").strip()
+            if not s or s.startswith("-"):
+                continue
+            m = PINNED.match(s)
+            if m:
+                pins.append((m.group(1), m.group(2), f, i))
+            else:
+                loose += 1
+    res.metrics["python_packages_audited"] = len(pins)
+    res.metrics["python_packages_unverified"] = loose
+    if loose:
+        res.notes.append(f"{loose} 条 Python 依赖没有用 == 锁定版本，静态模式下无法判断实际安装的版本，未做漏洞核查"
+                         "（--mode local 会用 pip-audit 核查实际安装的包）。")
+    if not pins:
+        return
+    hits: list[tuple[str, str, str, int, str]] = []
+    try:
+        for part in chunks(pins, 500):
+            q = {"queries": [{"package": {"name": n, "ecosystem": "PyPI"}, "version": v} for n, v, _, _ in part]}
+            r = _http_json(f"{OSV}/querybatch", q, timeout=60)
+            for (n, v, f, ln), item in zip(part, r.get("results", []), strict=False):
+                hits += [(n, v, f, ln, x["id"]) for x in item.get("vulns", [])]
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        res.skip("OSV.dev（requirements）", f"查询失败（需要联网）：{type(e).__name__}")
+        return
+    for n, v, f, ln, vid in hits:
+        det = _osv_detail(ctx, vid)
+        fixv = _osv_fixed(det, n)
+        aliases = [a for a in det.get("aliases", []) if a.startswith("CVE-")][:2]
+        res.findings.append(Finding(
+            category="09", tool="OSV.dev", rule=vid, severity=_osv_severity(det) if det else "high", file=f, line=ln,
+            message=f"{n} {v} 存在已知漏洞 {vid}" + (f"（{'、'.join(aliases)}）" if aliases else ""),
+            cause=(det.get("summary") or " ".join((det.get("details") or "").split()))[:300],
+            fix=f"升级到 {' / '.join(fixv[-3:])} 或更高。" if fixv else "暂无修复版本：评估是否受影响，或换用替代库。",
+            fix_code=f"pip install -U \"{n}>={fixv[-1]}\"" if fixv else "",
+            url=f"https://osv.dev/vulnerability/{vid}"))
+    res.use(f"OSV.dev 批量查询（requirements 里 == 锁定的 {len(pins)} 个包）")
 
 
 def _req_line(ctx: Context, f: str, name: str) -> int:
@@ -189,7 +247,7 @@ def _cargo_lock(ctx: Context, lock: str) -> int:
         for part in chunks(pkgs, 500):
             q = {"queries": [{"package": {"name": n, "ecosystem": "crates.io"}, "version": v} for n, v, _ in part]}
             r = _http_json(f"{OSV}/querybatch", q, timeout=60)
-            for (n, v, ln), item in zip(part, r.get("results", [])):
+            for (n, v, ln), item in zip(part, r.get("results", []), strict=False):
                 hits += [(n, v, ln, x["id"]) for x in item.get("vulns", [])]
     except (urllib.error.URLError, OSError, ValueError) as e:
         res.skip("OSV.dev（Cargo.lock）", f"查询失败（需要联网）：{type(e).__name__}")
@@ -217,7 +275,7 @@ def _cargo_outdated(ctx: Context) -> None:
         return
     rows = []
     for root in cargo_roots(ctx):
-        rc, out, err = run(["cargo", "update", "--dry-run"], cwd=ctx.base / root, env=cargo_env(ctx), timeout=300)
+        rc, out, err = run(["cargo", "update", "--dry-run"], cwd=ctx.base / root, env=cargo_env(ctx), timeout=300, network=True)
         if rc != 0:
             res.skip("cargo update --dry-run", "运行失败（需要联网）")
             return
@@ -261,8 +319,11 @@ def _npm(ctx: Context, lock: str) -> None:
     if not npm:
         res.skip("npm audit", "未安装 Node.js")
         return
+    if not ctx.local:  # npm 在项目目录里运行会读取项目的 .npmrc（可改 registry、script-shell）
+        res.skip("npm audit", STATIC_SKIP)
+        return
     cwd = (ctx.base / lock).parent
-    rc, out, err = run([npm, "audit", "--json", "--package-lock-only"], cwd=cwd, timeout=300)
+    rc, out, err = run([npm, "audit", "--json", "--package-lock-only", "--ignore-scripts"], cwd=cwd, timeout=300, network=True)
     try:
         data = json.loads(out)
     except ValueError:

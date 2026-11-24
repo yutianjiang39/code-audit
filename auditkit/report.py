@@ -33,14 +33,22 @@ def overview(ctx: Context, sc: dict) -> list[Block]:
     by = size.get("by_ext", {})
     langs = "、".join(f"{e} {v['files']} 个文件 / {v['code']:,} 行代码" for e, v in sorted(by.items(), key=lambda kv: -kv[1]["code"])[:6])
     c = sc["counts"]
+    ex = ctx.shared.get("excluded") or {}
+    if ctx.local:
+        mode = ("执行模式：**本机执行（local）**——运行了项目的测试、构建脚本和基准。子进程拿不到环境变量里的凭据，"
+                "但没有操作系统级隔离：项目代码以当前用户的权限运行，能读写这个用户能访问的文件、能联网")
+    else:
+        mode = ("执行模式：**静态（static）**——没有执行项目代码（不启动项目解释器、cargo、测试、基准），"
+                "因此 07 类和 Rust 的 Clippy（01 / 03 / 06 类）没有动态结果；需要时用 `--mode local`")
     out: list[Block] = [
         ("p", f"**综合评分：{sc['overall']} / 100（{sc['grade']} 级）**　·　"
               f"严重 {c['critical']}　高 {c['high']}　中 {c['medium']}　低 {c['low']}"),
-        ("list", [f"审查对象：`{ctx.target}`", f"审查时间：{ctx.shared['started']}",
+        ("list", [f"审查对象：`{ctx.target}`", f"审查时间：{ctx.shared['started']}", mode,
                   f"范围：{len(ctx.files)} 个文件，{langs}",
-                  "排除：" + ("、".join(f"`{g}`" for g in ctx.cfg.get("exclude", [])) or "无")
-                  + "；密钥目录（secrets/、*.key、*.pem、.env）始终不读取、不复制",
-                  "原项目没有被修改：所有工具都在审查系统自己的沙箱副本里运行，修复以 `fixes.patch` 交付"]),
+                  "排除：" + ("、".join(f"`{g}`" for g in ctx.cfg.get("exclude", [])) or "无"),
+                  f"始终不读取、不复制：密钥与凭据文件（本次按文件名或内容排除 {ex.get('sensitive', 0)} 个）、"
+                  f"符号链接与目录联接（本次排除 {ex.get('links', 0)} 个）；报告和 raw 输出里形似密钥的内容替换为 `[已脱敏]`",
+                  "原项目没有被修改：所有工具都在审查系统自己的副本里运行，修复以 `fixes.patch` 交付"]),
         ("table", ["类别", "得分", "严重", "高", "中", "低", "权重", "使用的工具"],
          [[f"{r['id']} {r['name']}", "—" if r["score"] is None else f"{r['score']:.0f}",
            r["counts"]["critical"], r["counts"]["high"], r["counts"]["medium"], r["counts"]["low"],
@@ -108,6 +116,8 @@ def fix_sections(ctx: Context) -> list[tuple[str, list[Block]]]:
         b.append(("table", ["基准", "修复前（中位数）", "修复后（中位数）", "变化", "结论"], rows))
         b.append(("p", f"每个基准在两份副本里交替运行 {bench[0].get('repeat', '?')} 次。自动补丁只做不改变行为的清理，"
                        "预期不会带来可测量的性能变化；这张表的作用是确认补丁没有让程序变慢。真正的性能收益来自 03 类里列出的问题，需要人工修改。"))
+    elif not ctx.local:
+        b.append(("p", "静态模式不执行项目代码，没有跑基准。`--mode local` 且 profile 里配置了 bench 命令时才有实测对比。"))
     else:
         b.append(("p", "profile 里没有配置 bench 命令，未做实测对比。"))
     tb, ta = fx.get("tests_before"), fx.get("tests_after")
@@ -122,6 +132,9 @@ def fix_sections(ctx: Context) -> list[tuple[str, list[Block]]]:
                   ([["修复前（原代码）", tb["ran"], tb["failed"], tb["errors"], tb["skipped"], f"{tb['seconds']}s", "通过" if tb["ok"] else "失败"]] if tb else [])
                   + [["修复后（应用补丁）", ta["ran"], ta["failed"], ta["errors"], ta["skipped"], f"{ta['seconds']}s", "通过" if ta["ok"] else "失败"]]))
         b.append(("p", f"应用补丁后的 Python 测试：{ok}。完整输出在 `raw/tests_fixed.txt`。"))
+    elif not ctx.local:
+        b.append(("p", "静态模式不执行项目代码，**补丁没有经过测试验证**（只做了语法校验和 `git apply --check`）。"
+                       "应用前请自己跑一遍测试，或用 `--mode local` 重新审查。"))
     else:
         b.append(("p", "profile 里没有配置 python.test_cmd，无法在修复后自动跑测试。"))
     rt = ctx.cat("07").metrics.get("rust_tests")
@@ -170,15 +183,23 @@ def metric_blocks(ctx: Context, cid: str) -> list[Block]:
             out.append(("table", ["覆盖率最低的文件", "覆盖率", "语句数", "未覆盖"], [[f"`{a}`", f"{b}%", c, d] for a, b, c, d in m["python_coverage_files"][:10]]))
     if cid == "08":
         if "sql_statements" in m:
-            items.append(f"SQL 语句：{m['sql_statements']} 条，其中 {m['sql_checked']} 条做了执行计划分析，{m['sql_dynamic']} 条是动态拼接，"
-                         f"{m['sql_unverified']} 条无法静态分析（依赖运行时建的表或参数）")
-            items.append(f"还原出的表：{'、'.join(m['schema_tables']) or '无'}；索引 {len(m['schema_indexes'])} 个")
+            items.append(f"SQL 来源：{m['sql_statements']} 处（代码里的 SQL 字符串 {m['sql_statements'] - m.get('sql_from_files', 0)} 处，"
+                         f"独立 .sql 文件里的语句 {m.get('sql_from_files', 0)} 条），其中 {m['sql_dynamic']} 处是动态拼接")
+            items.append(f"查询 / 写入语句：{m['sql_checked']} 条做了 SQLite 执行计划分析；{m.get('sql_static_only', 0)} 条是 MySQL / PostgreSQL，"
+                         f"只做静态规则检查；{m['sql_unverified']} 条拿不到执行计划（依赖运行时建的表或参数），同样只做静态规则检查")
+            if m.get("sql_dialects"):
+                items.append("识别到的方言（按语句数）：" + "、".join(f"{k} {v}" for k, v in m["sql_dialects"].items()))
+            tables = m["schema_tables"]
+            items.append(f"还原出的表（{len(tables)} 张）：{'、'.join(tables[:30]) or '无'}{' …' if len(tables) > 30 else ''}；"
+                         f"索引 {len(m['schema_indexes'])} 个")
         if m.get("sqlite_files"):
             out.append(("table", ["SQLite 文件", "完整性", "大小 MB", "空闲页 %", "journal"], [[f"`{a}`", b, c, d, e] for a, b, c, d, e in m["sqlite_files"]]))
     if cid == "09":
         for k, label in (("python_packages_audited", "已审计 Python 包"), ("rust_crates_audited", "已审计 Rust crate")):
             if k in m:
                 items.append(f"{label}：{m[k]}")
+        if m.get("python_packages_unverified"):
+            items.append(f"未核查的 Python 依赖（没有用 == 锁定版本）：{m['python_packages_unverified']} 条")
         if m.get("python_outdated"):
             rows = m["python_outdated"]
             items.append(f"Python 可升级：{len(rows)} 个（直接依赖 {sum(1 for r in rows if r[3])} 个）："
@@ -378,6 +399,7 @@ def write_all(ctx: Context, sc: dict) -> None:
     (ctx.out / "report.html").write_text(to_html(ctx, sc, secs), encoding="utf-8")
     payload = {
         "project": ctx.cfg.get("name", ctx.target.name), "target": str(ctx.target), "started": ctx.shared["started"],
+        "mode": ctx.shared.get("mode", "static"), "excluded": ctx.shared.get("excluded") or {},
         "score": sc, "fix_stage": ctx.shared.get("fix"),
         "categories": {cid: {"name": r.name, "applicable": r.applicable, "score": r.score, "tools_used": r.tools_used,
                              "tools_skipped": r.tools_skipped, "metrics": r.metrics, "notes": r.notes} for cid, r in sorted(ctx.results.items())},
