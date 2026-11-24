@@ -1,0 +1,7 @@
+# 审查用的 Clippy 配置（通过 CLIPPY_CONF_DIR 传入，不修改被审查项目）
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = true
+cognitive-complexity-threshold = 30
+too-many-lines-threshold = 150

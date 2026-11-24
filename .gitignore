@@ -1,0 +1,7 @@
+.venv/
+.work/
+.tools/
+reports/
+__pycache__/
+profiles/*.json
+!profiles/example.json

@@ -1,0 +1,7 @@
+ruff==0.17.6
+pylint==4.1.4
+vulture==2.16
+pip-audit==2.10.1
+coverage==7.17.5
+semgrep==1.186.0
+py-spy==0.4.4

@@ -1,0 +1,35 @@
+{
+  "name": "myproj",
+  "target": "../MyProj",
+  "exclude": ["vendor/*"],
+  "test_globs": ["tests/*"],
+  "python": {
+    "interpreter": "{target}/.venv/Scripts/python.exe",
+    "min_version": "3.11",
+    "test_cmd": ["-m", "unittest", "discover", "-s", "tests", "-t", "."]
+  },
+  "rust": {
+    "manifest_dirs": ["rust"],
+    "run_tests": true
+  },
+  "architecture": {
+    "allowed_imports": {
+      "app": ["app"],
+      "ops": ["ops", "app"]
+    }
+  },
+  "accepted": [
+    {
+      "rule": "no-restart",
+      "file": "ops/*.service",
+      "reason": "写明为什么这条命中可以接受；它不计分，但会列在报告末尾。"
+    }
+  ],
+  "bench": [
+    {
+      "name": "导入 app 包（冷启动开销）",
+      "cmd": ["{python}", "-c", "import app"],
+      "repeat": 7
+    }
+  ]
+}
